@@ -24,7 +24,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(__dirname, '..');
 
 /** 由桥接托管的两个 preset（顺序即 patch 层顺序）。 */
-export const PRESETS = ['qq-chat', 'qq-chat-v2'];
+export const PRESETS = ['qq-chat', 'qq-chat-v2', 'book-extractor'];
 
 /** preset 行 id：与 config.id（桥接解析的 preset 名）区分开，方便在 profile patch 里按行定位。 */
 export function presetRowId(name) {
@@ -41,10 +41,12 @@ export function presetRowId(name) {
  * node_modules junction 由 setup-dsh.mjs 或 dev_heal_links 维护。
  */
 export const GUARD_SPECIFIER = 'qq-agent-presets/qq-tool-restrict.mjs';
+export const BOOK_GUARD_SPECIFIER = 'qq-agent-presets/book-tool-deny.mjs';
 
 /** 源里允许出现的相对行名 → 新机制下的等价引用。其它相对名一律报错（避免静默装不上）。 */
 const RELATIVE_ROW_REWRITES = new Map([
   ['./qq-tool-restrict.mjs', GUARD_SPECIFIER],
+  ['./book-tool-deny.mjs', BOOK_GUARD_SPECIFIER],
 ]);
 
 export const BUNDLE_DIR = path.join(REPO_ROOT, 'plugins', 'qq-agent-presets');
@@ -103,7 +105,7 @@ function normalizeRows(rows, preset) {
     return next;
   });
   const normalized = walk(rows, 'plugins');
-  for (const required of ['persona', 'qq-tool-restrict']) {
+  for (const required of ['persona', preset === 'book-extractor' ? 'book-tool-deny' : 'qq-tool-restrict']) {
     if (!seen.has(required)) throw new Error(`${preset}: 行列表缺少 ${required} 行（安全/人格边界不允许缺失）`);
   }
   return normalized;

@@ -19,10 +19,15 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as bookStore from '../src/bookbot-store.js';
+import * as bookbotModule from '../src/bookbot.js';
+import * as bookExtractor from '../src/bookbot-extractor.js';
+import * as bookMedia from '../src/bookbot-media.js';
+import * as bookQuery from '../src/bookbot-query.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-export async function bridgeHarness({ config = {}, savedState, globals = {} } = {}) {
+export async function bridgeHarness({ config = {}, savedState, globals = {},messages = {} } = {}) {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-'));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
@@ -73,6 +78,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     callUnary: async (method, params) => { calls.cancelled.push({ method, params }); return success({ accepted: true }); },
   };
   class FakeBot {
+    async getMessage(id) { return messages[String(id)] ?? null; }
     async sendPrivateMessage(id, text) { calls.sent.push({ kind: 'private', id, text }); }
     async sendGroupMessage(id, text) { calls.sent.push({ kind: 'group', id, text }); }
     async getImage({ file }) {
@@ -110,6 +116,13 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     flushQueue, retireSession,
     voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
+    auditAndSend, captureSendGuard,
+    recordSessionUsage,
+    recordSessionSnapshot,
+    getCollectorCount() { return collectors.size; },
+    getModelCacheSizes() { return { applied:modelAppliedSessions.size,models:sessionModels.size }; },
+    getBookbot() { return typeof bookbot === 'undefined' ? null : bookbot; },
+    getBookExtractor() { return typeof bookExtractor === 'undefined' ? null : bookExtractor; },
     setMode(value) { currentMode = value; },
     setReady(value) { dshReady = value; },
     setPresets(value) { dshPresetIds = value; dshDefaultPreset = 'standard'; },
@@ -133,6 +146,7 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl,
+    ...bookStore, ...bookbotModule, ...bookExtractor, ...bookMedia, ...bookQuery,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),
@@ -164,6 +178,9 @@ export async function bridgeHarness({ config = {}, savedState, globals = {} } = 
   bridge.setPresets(['standard', 'qq-chat', 'qq-chat-v2']);
   bridge.setReady(true);
   return { ...bridge, calls, temp, async close() {
+    bridge.getBookExtractor()?.failAll();
+    const book = bridge.getBookbot();
+    if (book) { await book.stop(); book.store.close(); }
     for (const timer of timers) clearTimeout(timer);
     fs.rmSync(temp, { recursive: true, force: true });
   } };

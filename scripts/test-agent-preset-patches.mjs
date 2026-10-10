@@ -12,7 +12,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import yaml from 'js-yaml';
 import {
-  BUNDLE_DIR, GUARD_SPECIFIER, PRESETS, REPO_ROOT,
+  BUNDLE_DIR, GUARD_SPECIFIER, BOOK_GUARD_SPECIFIER, PRESETS, REPO_ROOT,
   buildPatches, patchFileFor, presetRowId,
 } from './build-agent-preset-patches.mjs';
 
@@ -52,6 +52,7 @@ for (const name of PRESETS) {
   const source = load(path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'agent.cordis.yml'));
   const expected = structuredClone(source);
   for (const r of expected) if (r.name === './qq-tool-restrict.mjs') r.name = GUARD_SPECIFIER;
+  for (const r of expected) if (r.name === './book-tool-deny.mjs') r.name = BOOK_GUARD_SPECIFIER;
   assert.deepEqual(row.config.plugins, expected, `${name}: config.plugins 必须与 agent.cordis.yml 完全一致（守卫名除外）`);
   ok(true, `${name}: config.plugins 与 agent.cordis.yml 逐字一致（${expected.length} 行）`);
 
@@ -65,12 +66,13 @@ for (const name of PRESETS) {
 console.log('## 3. 守卫行引用方式：只用「profile 目录可解析」的裸说明符');
 for (const name of PRESETS) {
   const row = load(patchFileFor(name))[0].insert[0];
-  const guard = row.config.plugins.find((r) => r.id === 'qq-tool-restrict');
-  ok(guard !== undefined, `${name}: 有 qq-tool-restrict 守卫行`);
-  ok(guard?.name === GUARD_SPECIFIER, `${name}: 守卫行 name = ${GUARD_SPECIFIER}`);
+  const specifier = name === 'book-extractor' ? BOOK_GUARD_SPECIFIER : GUARD_SPECIFIER;
+  const guard = row.config.plugins.find((r) => r.id === (name === 'book-extractor' ? 'book-tool-deny' : 'qq-tool-restrict'));
+  ok(guard !== undefined, `${name}: 有专用工具守卫行`);
+  ok(guard?.name === specifier, `${name}: 守卫行 name = ${specifier}`);
   const bad = row.config.plugins.filter((r) => typeof r.name === 'string' && (r.name.startsWith('.') || path.isAbsolute(r.name)));
   ok(bad.length === 0, `${name}: 没有任何相对/绝对路径子行名（0.1.7 下会按 profile 目录解析而装不上）${bad.length ? `：${bad.map((r) => r.name).join(', ')}` : ''}`);
-  const guardFile = path.join(BUNDLE_DIR, GUARD_SPECIFIER.slice('qq-agent-presets/'.length));
+  const guardFile = path.join(BUNDLE_DIR, specifier.slice('qq-agent-presets/'.length));
   ok(fs.existsSync(guardFile), `${name}: 守卫实现存在（${path.relative(REPO_ROOT, guardFile)}）`);
 }
 
@@ -92,7 +94,7 @@ console.log('## 4. bundle 声明与安全边界');
   }
   // 一份实现：两个 preset 目录下的同名文件必须是 re-export 壳，且导出同名成员。
   const canonicalMod = await import(pathToFileURL(canonical).href);
-  for (const name of PRESETS) {
+  for (const name of PRESETS.filter(name => name !== 'book-extractor')) {
     const shim = path.join(REPO_ROOT, 'dsh', 'agent-presets', name, 'qq-tool-restrict.mjs');
     ok(/^export \* from '\.\.\/\.\.\/\.\.\/plugins\/qq-agent-presets\/qq-tool-restrict\.mjs'$/m.test(read(shim).trim()),
       `${name}/qq-tool-restrict.mjs 是指向唯一实现的 re-export 壳`);
