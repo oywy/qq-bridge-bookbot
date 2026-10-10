@@ -28,6 +28,11 @@ import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
+import { BookbotStore } from './bookbot-store.js';
+import { Bookbot, bookbotAllowed, bookbotOnlyBooks } from './bookbot.js';
+import { DshBookExtractor } from './bookbot-extractor.js';
+import { fetchQqVoiceText } from './bookbot-media.js';
+let cleanupBookbot = () => {};
 import {
   loadSlang,
   saveSlang,
@@ -655,6 +660,7 @@ function loadConfig() {
     consoleToken: file.consoleToken ?? '',
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
+    bookbot: { enabled:false, groups:[], onlyBooks:true, naturalLanguage:true, ...(file.bookbot ?? {}), media:{images:true,voice:'qq',...(file.bookbot?.media ?? {})} },
     security: {
       interceptNotify: true,
       ...(file.security ?? {})
@@ -2232,6 +2238,39 @@ async function main() {
     // 默认只允许把 launch token 交给回环地址；远程 DSH 需要显式 opt-in（见 dsh-client.ensureAuth）。
     allowRemote: cfg.dsh.allowRemote === true
   });
+  // Optional, durable book collection is independent of conversational wake/mode.
+  const bookStore = cfg.bookbot.enabled === true ? new BookbotStore(path.join(STATE_DIR,'bookbot.sqlite')) : null;
+  const bookExtractor = bookStore ? new DshBookExtractor({
+    api, createTurnCollector,
+    resolvePreset: () => resolvePresetName('book-extractor',{strict:true}),
+    workspacePath: path.join(STATE_DIR,'bookbot-agent'),
+    selectModel: ensureBookModel,
+    onRetire: sessionId => {
+      modelAppliedSessions.delete(sessionId);
+      sessionModels.delete(sessionId);
+      collectors.delete(sessionId);
+    },
+    timeoutMs: Math.max(1000,Math.min(600000,Number(cfg.bookbot.timeoutMs)||120000)),
+  }) : null;
+  if (bookStore) fs.mkdirSync(path.join(STATE_DIR,'bookbot-agent'),{recursive:true});
+  const bookbot = bookStore ? new Bookbot({
+    store:bookStore, getConfig:() => cfg,
+    extract: (batch,context,assertAuthorized) => { if (!dshReady) throw new Error('DSH not ready'); return bookExtractor.extract(batch,context,assertAuthorized); },
+    interpret: (source,context,catalogue,assertAuthorized) => {if(!dshReady)throw new Error('DSH not ready');return bookExtractor.interpret(source,context,catalogue,assertAuthorized);},
+    resolveBotQuote: ({accountId,groupId,messageId}) => resolveReplyInfo('group',groupId,messageId,accountId),
+    recognizeImages: async (source,assertAuthorized) => {
+      assertAuthorized();if(!dshReady)throw new Error('DSH not ready');
+      const parts=await resolveMediaList(source.media.images,{strict:true,assertAuthorized});
+      assertAuthorized();return bookExtractor.recognizeImages(parts,assertAuthorized);
+    },
+    transcribeVoice: (source,assertAuthorized) => fetchQqVoiceText(source,cfg,{fetch,assertAuthorized,timeoutMs:Math.max(1000,Math.min(60000,Number(cfg.bookbot.voiceTimeoutMs)||30000))}),
+    send: (key,reply,bookbotSourceGuard) => auditAndSend(key,reply,{bookbotQuery:true,bookbotSourceGuard}),
+    log:message => log(message),
+  }) : null;
+  if (bookbot) cleanupBookbot = () => {
+    bookExtractor.failAll();
+    void bookbot.stop().then(() => bookStore.close()).catch(() => {});
+  };
   // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
   // `api.sessions.modelCatalog` —— 桥接钉住的 `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2`
   // 的 sessions 门面里根本没有这个方法（只有 `models` → 已下线的 `session/models`），
@@ -2326,6 +2365,8 @@ async function main() {
   function recordSessionSnapshot(sessionId, snapshot) {
     try {
       if (!snapshot) return;
+      const key = reverse.get(sessionId);
+      if (!key && !learnerSessions.has(sessionId) && !bookExtractor?.pending.has(sessionId)) return;
       const selection = snapshot.projections?.values?.modelSelection;
       rememberModel(sessionId, selection?.lastUsed ?? selection?.pending ?? null);
       const known = sessionModels.get(sessionId);
@@ -2337,7 +2378,7 @@ async function main() {
         provider: known?.provider ?? cfg.dsh?.provider
       });
       tokenLedger.ingestSnapshotRecords({ sessionId, records: snapshot.records });
-      rebuildInFlightCollector(sessionId, snapshot.records);
+      if (key && isCurrentSession(key,sessionId)) rebuildInFlightCollector(sessionId, snapshot.records);
     } catch (error) {
       log('token 账本：处理会话快照失败', error?.message ?? error);
     }
@@ -2553,7 +2594,7 @@ async function main() {
   }
 
   function isCurrentSession(key, sessionId) {
-    return isSessionAllowedInCurrentMode(key) && state.sessions[key] === sessionId
+    return !isBookOnlyKey(key) && isSessionAllowedInCurrentMode(key) && state.sessions[key] === sessionId
       && state.sessionPolicies[key] === sessionPolicy(key);
   }
 
@@ -2976,6 +3017,7 @@ async function main() {
     };
     const agentTokenOk = (key, token) => {
       const canonical = canonicalV2Key(key);
+      if (isBookOnlyKey(canonical ?? key)) return false;
       const st = socialV2.conversations.get(canonical ?? key);
       return !!st && !!st.agentToken && tokenEq(token, st.agentToken);
     };
@@ -2989,13 +3031,13 @@ async function main() {
      */
     const isLiveAgentToken = (token) => {
       if (typeof token !== 'string' || !token) return false;
-      for (const st of socialV2.conversations.values()) {
-        if (st?.agentToken && tokenEq(token, st.agentToken)) return true;
+      for (const [key,st] of socialV2.conversations) {
+        if (!isBookOnlyKey(key) && st?.agentToken && tokenEq(token, st.agentToken)) return true;
       }
       return false;
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
-    const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    const v2SessionAllowed = key => !isBookOnlyKey(canonicalV2Key(key) ?? key) && isSessionAllowedInCurrentMode(key);
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -6800,8 +6842,8 @@ async function main() {
   // 更新 lastAiReplyAt / 活跃调度，实际群里什么都没收到，而且只有一行滚动日志能看出问题。
   const lastSendFailed = new Map(); // key -> true（下一次成功即清除）
 
-  function sendToQQ(key, msg) {
-    const assertSendAllowed = captureSendGuard(key);
+  function sendToQQ(key, msg, options = {}) {
+    const assertSendAllowed = captureSendGuard(key,options);
     const safeMsg = redactKnownTokensOnly(msg);
     const [kind, id] = key.split(':');
     const parts = splitForQQ(safeMsg);
@@ -7178,10 +7220,11 @@ async function main() {
     return /^[\w.+=@-]+$/.test(s);
   }
 
-  async function fetchOneBotImage(media) {
+  async function fetchOneBotImage(media,{strict=false,assertAuthorized=()=>{}}={}) {
     // 优先使用 OneBot get_image 获取网关侧信息；只有 file 是安全缓存文件名时才允许交给网关。
     if (media.kind === 'image' && media.file && isProbablySafeImageFileRef(media.file)) {
       try {
+        assertAuthorized();
         const info = await bot.getImage({ file: String(media.file) });
         const obj = info && typeof info === 'object' ? info : {};
         const base64 = base64FromMaybe(obj.data) || base64FromMaybe(obj.base64) || base64FromMaybe(obj.file);
@@ -7191,21 +7234,22 @@ async function main() {
             const buf = Buffer.from(base64, 'base64');
             if (buf.length > 0 && looksLikeImageBuffer(buf)) {
               const dims = getImageDimensions(buf);
-              if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-                log(`get_image 返回的图片像素超限，已跳过（${dims.width}x${dims.height}）`);
+              if ((strict && (!dims || !dims.width || !dims.height)) || (dims && dims.width * dims.height > MAX_MEDIA_PIXELS)) {
+                if(!strict)log(`get_image 返回的图片像素超限，已跳过（${dims?.width}x${dims?.height}）`);
               } else {
                 return { buffer: buf, mimeType: mimeFromBuffer(buf) };
               }
             }
           } else {
-            log(`get_image 返回的图片 base64 超限，已跳过（${Math.round(base64.length * 3 / 4 / 1024)}KB）`);
+            if(!strict)log(`get_image 返回的图片 base64 超限，已跳过（${Math.round(base64.length * 3 / 4 / 1024)}KB）`);
           }
         }
         if (obj.url) {
+          assertAuthorized();
           const fetched = await safeFetchBuffer(String(obj.url), MAX_MEDIA_BYTES);
           const dims = getImageDimensions(fetched.buffer);
-          if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-            log(`get_image URL 图片像素超限，已跳过（${dims.width}x${dims.height}）`);
+          if ((strict && (!dims || !dims.width || !dims.height)) || (dims && dims.width * dims.height > MAX_MEDIA_PIXELS)) {
+            if(!strict)log(`get_image URL 图片像素超限，已跳过（${dims?.width}x${dims?.height}）`);
           } else {
             return { buffer: fetched.buffer, mimeType: mimeFromBuffer(fetched.buffer) || mimeFromUrl(obj.url) };
           }
@@ -7213,33 +7257,35 @@ async function main() {
         if (typeof obj.file === 'string' && !obj.file.startsWith('base64://') && fs.existsSync(obj.file) && isSafeLocalMediaPath(obj.file)) {
           const stat = fs.statSync(obj.file);
           if (stat.size > MAX_MEDIA_BYTES) {
-            log(`本地图片文件超限，已跳过（${Math.round(stat.size / 1024)}KB）`);
+            if(!strict)log(`本地图片文件超限，已跳过（${Math.round(stat.size / 1024)}KB）`);
           } else {
             const buf = fs.readFileSync(obj.file);
+            if(strict && !looksLikeImageBuffer(buf))throw new Error('Invalid image');
             const dims = getImageDimensions(buf);
-            if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-              log(`本地图片像素超限，已跳过（${dims.width}x${dims.height}）`);
+            if ((strict && (!dims || !dims.width || !dims.height)) || (dims && dims.width * dims.height > MAX_MEDIA_PIXELS)) {
+              if(!strict)log(`本地图片像素超限，已跳过（${dims?.width}x${dims?.height}）`);
             } else {
               return { buffer: buf, mimeType: mimeFromBuffer(buf) };
             }
           }
         }
       } catch (error) {
-        log(`get_image 解析失败: ${error?.message ?? error}`);
+        if(!strict)log(`get_image 解析失败: ${error?.message ?? error}`);
       }
     }
     // 其次直接用消息段里的 URL
     if (media.url) {
       try {
+        assertAuthorized();
         const fetched = await safeFetchBuffer(String(media.url), MAX_MEDIA_BYTES);
         const dims = getImageDimensions(fetched.buffer);
-        if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
-          log(`图片 URL 像素超限，已跳过（${dims.width}x${dims.height}）`);
+        if ((strict && (!dims || !dims.width || !dims.height)) || (dims && dims.width * dims.height > MAX_MEDIA_PIXELS)) {
+          if(!strict)log(`图片 URL 像素超限，已跳过（${dims?.width}x${dims?.height}）`);
         } else {
           return { buffer: fetched.buffer, mimeType: mimeFromBuffer(fetched.buffer) || mimeFromUrl(media.url) };
         }
       } catch (error) {
-        log(`图片 URL 抓取失败: ${error?.message ?? error}`);
+        if(!strict)log(`图片 URL 抓取失败: ${error?.message ?? error}`);
       }
     }
     return null;
@@ -7273,7 +7319,8 @@ async function main() {
     return { text: `[表情#${media.faceId}]` };
   }
 
-  async function resolveMediaList(mediaList) {
+  async function resolveMediaList(mediaList,{strict=false,assertAuthorized=()=>{}}={}) {
+    if(strict && (!Array.isArray(mediaList) || !mediaList.length || mediaList.length>MAX_MEDIA_COUNT))throw new Error('Invalid bookbot images');
     const parts = [];
     let index = 0;
     let totalBytes = 0;
@@ -7298,7 +7345,9 @@ async function main() {
           parts.push({ type: 'text', text: face.text || `[表情#${media.faceId}]` });
         }
       } else {
-        const img = await fetchOneBotImage(media);
+        assertAuthorized();
+        const img = await fetchOneBotImage(media,{strict,assertAuthorized});
+        assertAuthorized();
         if (img?.buffer) {
           if (totalBytes + img.buffer.length > MAX_MEDIA_BYTES) {
             parts.push({ type: 'text', text: `[图片${index}（图片总大小超限，已跳过）]` });
@@ -7312,6 +7361,7 @@ async function main() {
         }
       }
     }
+    if(strict && parts.filter(p=>p.type==='image').length!==mediaList.length)throw new Error('Bookbot image unavailable');
     return parts;
   }
 
@@ -7487,10 +7537,20 @@ async function main() {
   }
 
   // 入队校验无法约束排队等待期间的权限变化，每条消息临近实际发送时再次校验。
-  function captureSendGuard(key) {
+  function isBookOnlyKey(key) {
+    const match = /^group:(\d+)$/.exec(key);
+    return Boolean(match && bookbotOnlyBooks(match[1],cfg));
+  }
+  function captureSendGuard(key, {bookbotQuery = false,bookbotSourceGuard} = {}) {
     const policy = sessionPolicy(key);
     const sessionId = state.sessions[key];
     return () => {
+      if (bookbotQuery) {
+        bookbotSourceGuard?.();
+        const match = /^group:(\d+)$/.exec(key);
+        if (!match || !bookbotAllowed(match[1],cfg)) throw new Error('发送已取消：书单群授权已变化');
+        if (shouldBlockSilentReply(key)) throw new Error('发送已取消：静默模式已开启');
+      } else if (isBookOnlyKey(key)) throw new Error('发送已取消：本群仅启用书单');
       if (!isSessionAllowedInCurrentMode(key) || policy !== sessionPolicy(key)
           || (sessionId && state.sessions[key] !== sessionId)) {
         throw new Error('发送已取消：会话、模式或白名单已变化');
@@ -7505,17 +7565,17 @@ async function main() {
   }
 
   // 统一出站消息：先完整文本审计，再发送。返回是否真的发出。
-  async function auditAndSend(key, text) {
+  async function auditAndSend(key, text, options = {}) {
     const hasKnownToken = [...KNOWN_AGENT_TOKENS].some((t) => t && String(text ?? '').includes(t));
     if (shouldAuditKey(key) && (SENSITIVE_RE.test(text) || hasKnownToken)) {
       log(`⚠️ 回复被安全策略拦截 (${key})，疑似包含敏感信息${hasKnownToken ? '（含会话令牌）' : ''}`);
       appendActivity(`${key} agent 回复被拦截（疑似敏感信息${hasKnownToken ? '/会话令牌' : ''}）`);
       if (cfg.security?.interceptNotify !== false) {
-        await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。');
+        await sendToQQ(key, '⚠️ 本条回复因疑似包含敏感信息（路径/凭据/会话令牌）被安全策略拦截，已记录并通知管理员。',options);
       }
       return false;
     }
-    await sendToQQ(key, text);
+    await sendToQQ(key, text,options);
     return true;
   }
 
@@ -7527,6 +7587,15 @@ async function main() {
   // 返回 'applied' | 'not-found' | 'failed'。
   // 'not-found' 表示 DSH 侧会话已经不存在（DSH 重启、异常退出、归档竞态），
   // 本地映射已失效，调用方必须退役重建，否则每条消息都会对着一个不存在的会话重试。
+  async function ensureBookModel(sessionId) {
+    // Extraction fails closed on selection errors and never logs model/config details.
+    const provider=String(cfg.dsh?.provider || 'deepseek-official');
+    const model=String(cfg.dsh?.model || 'deepseek-flash');
+    const reasoningEffort=String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT);
+    unwrap(await api.sessions.selectModel({sessionId,provider,model,reasoningEffort}),'bookbot model selection');
+    if(!bookExtractor.pending.has(sessionId))throw new Error('Bookbot session retired');
+    modelAppliedSessions.set(sessionId,modelSelectionEpoch);
+  }
   async function ensureChatModel(sessionId) {
     if (modelAppliedSessions.get(sessionId) === modelSelectionEpoch) return 'applied';
     const provider = String(cfg.dsh?.provider || 'deepseek-official');
@@ -7555,6 +7624,7 @@ async function main() {
   }
 
   async function ensureSession(key) {
+    if (isBookOnlyKey(key)) throw new Error('本群仅启用书单，通用聊天会话已禁用');
     const epoch = sessionEpoch;
     const policy = sessionPolicy(key);
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
@@ -8394,6 +8464,7 @@ async function main() {
 
   // 实际的 DSH prompt 投递（不再直接对外暴露，统一走 promptQueues 串行队列）。
   async function deliverPromptNow(key, promptText, opts = {}) {
+    if (isBookOnlyKey(key)) throw new Error('本群仅启用书单，通用聊天提示已禁用');
     if (!isSessionAllowedInCurrentMode(key)) throw new Error(`当前模式不允许会话 ${key}`);
     // Recheck queued wakes at dispatch time: no model call while paused/disabled
     // and no reserved2 prompt leaking into an ordinary chat after a mode switch.
@@ -9521,6 +9592,7 @@ async function main() {
   }
 
   async function sendWakePromptV2(key, reason) {
+    if (isBookOnlyKey(key)) return;
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
     if (!isSessionAllowedInCurrentMode(key)) {
@@ -9847,6 +9919,7 @@ async function main() {
   // QQ 消息 → DSH prompt
   async function handleIncoming(kind, id, event, cfg) {
     const key = convKey(kind, id);
+    if (kind === 'group' && bookbot && await bookbot.handle(event)) return;
     if (!modeAllowed(key, kind, id, cfg, currentMode)) {
       log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
       return;
@@ -10281,7 +10354,7 @@ async function main() {
       id = String(peer);
       key = convKey('private', id);
     }
-    if (!modeAllowed(key, kind, id, cfg, currentMode)) return;
+    if (isBookOnlyKey(key) || !modeAllowed(key, kind, id, cfg, currentMode)) return;
     if (currentMode !== 'reserved2') {
       appendActivity(`${key} 收到拍一拍事件（非 reserved2，仅记录）：${senderId} -> ${targetId}`);
       return;
@@ -10354,6 +10427,7 @@ async function main() {
             // Token 记账放在最前面：无论会话是否仍属当前模式/是否学习会话，
             // 花掉的钱都是真的，都必须入账（归属由 resolveKey 决定）。
             recordSessionUsage(frame.sessionId, frame.event);
+            if (bookExtractor?.onEvent(frame.sessionId,frame.event)) continue;
             const key = reverse.get(frame.sessionId);
             if (!key) {
               // 黑话学习会话：只收集 turn，不发送 QQ，并唤醒等待中的学习任务。
@@ -10766,6 +10840,7 @@ async function main() {
       } catch (error) {
         log('事件流中断:', error?.message ?? error);
       } finally {
+        bookExtractor?.failAll();
         // WebSocket 正常关闭和异常中断都会走到这里；必须清掉旧 turn 相关状态，
         // 否则重连后旧 collector/标记残留会导致回复重复累加或误判。
         collectors.clear(); // 清除旧 turn collector，避免重连后残留导致重复累加
@@ -10794,6 +10869,7 @@ async function main() {
     accessToken: cfg.snowluma.accessToken || undefined,
     reconnect: true
   });
+  bookbot?.start();
 
   bot.onPrivateMessage(async (event) => {
     if (event.user_id === event.self_id) return;
@@ -11000,11 +11076,13 @@ async function main() {
 
 process.on('SIGINT', () => {
   log('退出中…');
+  cleanupBookbot();
   saveState();
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
+  cleanupBookbot();
   saveState();
   releaseLock();
   process.exit(0);
@@ -11028,7 +11106,7 @@ process.on('uncaughtException', (error) => {
   releaseLock();
   process.exit(1);
 });
-process.on('exit', () => releaseLock());
+process.on('exit', () => { cleanupBookbot(); releaseLock(); });
 
 main().catch((error) => {
   console.error('[bridge] 启动失败:', error);

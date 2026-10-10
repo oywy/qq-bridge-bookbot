@@ -303,6 +303,7 @@ export class NodeApiClient extends AbstractApiClient {
     this.cookiePromise = null;
     this._authEpoch = 0;
     this._muxSendOpen = null;
+    this._muxSendForget = null;
     // 持久化签名密钥的探测缓存：undefined=未探测，null=不可用，Buffer=可用。
     // 探一次就够（文件在 DSH 生命周期内不变），避免每个请求都读一次磁盘。
     this._secret = undefined;
@@ -656,12 +657,9 @@ export class NodeApiClient extends AbstractApiClient {
      * 不做这件事的话 `_desiredFollows` 只增不减：每次重连都会为一个早已不存在的会话
      * 重开一条 follow 流，并让 DSH 回一整份历史快照 —— 内存、重连延迟和账本基线行数
      * 都会随「历史上创建过的会话数」线性增长。
-     * 已经打开的流由 DSH 在会话消失时自行结束。
+     * 同时取消当前 mux 的逻辑流并丢弃尚未交付的帧；归档不会自动关闭 follow。
      */
-    forget: (sessionId) => {
-      if (!sessionId) return;
-      this._desiredFollows.delete(String(sessionId));
-    },
+    forget: (sessionId) => this._forgetSession(sessionId),
   };
 
   openRemoteEventStream(signal, onOpen) {
@@ -669,7 +667,7 @@ export class NodeApiClient extends AbstractApiClient {
     return {
       [Symbol.asyncIterator]: () => gen,
       follow: (sessionId) => this._followSession(sessionId),
-      forget: (sessionId) => { if (sessionId) this._desiredFollows.delete(String(sessionId)); }
+      forget: (sessionId) => this._forgetSession(sessionId)
     };
   }
 
@@ -679,6 +677,13 @@ export class NodeApiClient extends AbstractApiClient {
     // 先记账再发送：即使此刻没有连接（或正处在重连窗口内），重连时也会重放。
     this._desiredFollows.add(sid);
     if (this._muxSendOpen) this._muxSendOpen(sid);
+  }
+
+  _forgetSession(sessionId) {
+    if (!sessionId) return;
+    const sid = String(sessionId);
+    this._desiredFollows.delete(sid);
+    this._muxSendForget?.(sid);
   }
 
   async *_remoteMuxGenerator(signal, onOpen) {
@@ -708,6 +713,7 @@ export class NodeApiClient extends AbstractApiClient {
       if (ended) return;
       ended = true;
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
+      if (this._muxSendForget === sendForget) this._muxSendForget = null;
       // 连接断开（含鉴权失败/DSH 重启）时丢弃旧 Cookie，重连会重新 token exchange。
       if (!sig.aborted) this.invalidateAuth();
       enqueue({ kind: 'end' });
@@ -743,6 +749,28 @@ export class NodeApiClient extends AbstractApiClient {
         endStream();
       }
     };
+    const sendForget = (sessionId) => {
+      const streamId = sessionToStream.get(sessionId);
+      sessionToStream.delete(sessionId);
+      followed.delete(sessionId);
+      if (streamId) streamToSession.delete(streamId);
+      for (let i = inbox.length - 1; i >= 0; i--) {
+        const envelope = inbox[i].envelope;
+        const payload = envelope?.payload;
+        const retiredSessionFrame = (payload?.type === 'session/event' || payload?.type === 'session/snapshot') && payload.sessionId === sessionId;
+        if (retiredSessionFrame || (streamId && envelope?.rpcId === streamId)) inbox.splice(i,1);
+      }
+      if (ended || !socketOpen || !streamId) return;
+      try {
+        // DSH v0.2.0-rc.2 stream-protocol.ts L219-L251: `end` only
+        // half-closes uplink; `cancel` stops the complete logical stream.
+        // https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.0-rc.2/packages/api/gateway/src/stream-protocol.ts#L219-L251
+        socket.send(JSON.stringify({type:'cancel',streamId}));
+      } catch (error) {
+        console.error('[dsh-client] failed to cancel session/follow:',error?.message ?? error);
+        endStream();
+      }
+    };
     const sendOpenEvents = () => {
       if (ended || !socketOpen || eventStreamId) return;
       const streamId = randomUUID();
@@ -764,6 +792,7 @@ export class NodeApiClient extends AbstractApiClient {
       if (ended || sig.aborted) return;
       socketOpen = true;
       this._muxSendOpen = sendOpen;
+      this._muxSendForget = sendForget;
       // 重放**全部**期望 follow（跨重连保留），而不只是本次连接排队的那些。
       // 少了这一步，DSH 一重启，所有已存在的 QQ 会话就会静默失联。
       for (const sid of this._desiredFollows) sendOpen(sid);
@@ -904,12 +933,16 @@ export class NodeApiClient extends AbstractApiClient {
         while (inbox.length > 0) {
           const item = inbox.shift();
           if (item.kind === 'end') return;
+          const payload = item.envelope?.payload;
+          if ((payload?.type === 'session/event' || payload?.type === 'session/snapshot')
+            && !this._desiredFollows.has(String(payload.sessionId))) continue;
           yield item.envelope;
         }
         await new Promise((resolve) => { wake = resolve; });
       }
     } finally {
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
+      if (this._muxSendForget === sendForget) this._muxSendForget = null;
       sig.removeEventListener('abort', handleAbort);
       socket.removeEventListener('open', handleOpen);
       socket.removeEventListener('message', handleMessage);
