@@ -54,6 +54,22 @@
   "security": {
     "interceptNotify": true
   },
+  "bookbot": {
+    "enabled": false,
+    "groups": [],
+    "onlyBooks": true,
+    "naturalLanguage": true,
+    "batchMs": 15000,
+    "maxBatch": 30,
+    "contextMessages": 30,
+    "contextChars": 12000,
+    "retryMs": 60000,
+    "timeoutMs": 120000,
+    "media": { "images": true, "voice": "qq" },
+    "voiceTimeoutMs": 30000,
+    "rawRetentionDays": 7,
+    "maxReplyChars": 3500
+  },
   "slang": {
     "enabled": true,
     "extractMinMessages": 10,
