@@ -1,0 +1,3 @@
+name: 群聊书单提取
+description: 仅提取小说讨论为 JSON；所有工具在执行期拒绝，不联网、不发 QQ。
+order: 12
